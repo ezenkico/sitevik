@@ -5,6 +5,7 @@ use actix_web::{
 };
 use sitevik::static_files;
 use tempfile::TempDir;
+use toml::Value;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -21,27 +22,6 @@ fn fixture() -> TempDir {
     std::fs::write(root.path().join("private/secret.txt"), "secret").unwrap();
     std::fs::create_dir(root.path().join("empty")).unwrap();
     root
-}
-
-fn release_profile_table(manifest: &str) -> Option<&str> {
-    let mut offset = 0;
-    let mut table_start = None;
-
-    for line in manifest.split_inclusive('\n') {
-        let trimmed = line.trim();
-
-        if let Some(start) = table_start {
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                return Some(&manifest[start..offset]);
-            }
-        } else if trimmed == "[profile.release]" {
-            table_start = Some(offset + line.len());
-        }
-
-        offset += line.len();
-    }
-
-    table_start.map(|start| &manifest[start..])
 }
 
 #[actix_web::test]
@@ -273,32 +253,49 @@ async fn filesystem_failure_returns_internal_server_error() {
 async fn release_profile_contains_required_optimizations() {
     let manifest =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let manifest: Value = manifest.parse().unwrap();
+    let release_profile = manifest.get("profile").unwrap().get("release").unwrap();
 
-    let release_profile = release_profile_table(&manifest).unwrap();
-
-    for setting in [
-        "opt-level = 3",
-        "lto = \"fat\"",
-        "codegen-units = 1",
-        "strip = true",
-        "panic = \"abort\"",
-    ] {
-        assert!(
-            release_profile.lines().any(|line| line.trim() == setting),
-            "missing {setting}"
-        );
-    }
+    assert_eq!(
+        release_profile.get("opt-level").and_then(Value::as_integer),
+        Some(3)
+    );
+    assert_eq!(
+        release_profile.get("lto").and_then(Value::as_str),
+        Some("fat")
+    );
+    assert_eq!(
+        release_profile
+            .get("codegen-units")
+            .and_then(Value::as_integer),
+        Some(1)
+    );
+    assert_eq!(
+        release_profile.get("strip").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        release_profile.get("panic").and_then(Value::as_str),
+        Some("abort")
+    );
 }
 
 #[actix_web::test]
-async fn release_profile_table_excludes_other_tables() {
+async fn release_profile_excludes_following_table_with_inline_comment() {
     let manifest = r#"
 [profile.release]
 opt-level = 3
 
-[profile.dev]
+[profile.dev] # build settings
 lto = "fat"
 "#;
 
-    assert_eq!(release_profile_table(manifest), Some("opt-level = 3\n\n"));
+    let manifest: Value = manifest.parse().unwrap();
+    let release_profile = manifest.get("profile").unwrap().get("release").unwrap();
+
+    assert_eq!(
+        release_profile.get("opt-level").and_then(Value::as_integer),
+        Some(3)
+    );
+    assert!(release_profile.get("lto").is_none());
 }
