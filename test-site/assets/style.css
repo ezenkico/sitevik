@@ -1,0 +1,27 @@
+:root {
+  color: #18201b;
+  background: #eef3ef;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  width: min(38rem, calc(100% - 3rem));
+  margin: 12vh auto;
+}
+
+h1 {
+  margin: 0.25rem 0 1rem;
+}
+
+.route {
+  color: #52705c;
+  font-family: ui-monospace, monospace;
+}
+
+a {
+  color: #075b9d;
+}
