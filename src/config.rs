@@ -74,6 +74,9 @@ fn root_from_value(value: Option<OsString>) -> PathBuf {
 mod tests {
     use std::path::PathBuf;
 
+    #[cfg(unix)]
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
     use super::{Config, root_from_value};
 
     #[test]
@@ -99,6 +102,33 @@ mod tests {
             Some(root.path().as_os_str().to_owned()),
             None,
             Some("yes".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("SITEVIK_SPA"));
+    }
+
+    #[test]
+    fn spa_true_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::from_values(
+            Some(root.path().as_os_str().to_owned()),
+            None,
+            Some("true".into()),
+        )
+        .unwrap();
+
+        assert!(config.spa);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_spa_value_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let error = Config::from_values(
+            Some(root.path().as_os_str().to_owned()),
+            None,
+            Some(OsString::from_vec(vec![0xff])),
         )
         .unwrap_err();
 

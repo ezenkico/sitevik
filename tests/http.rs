@@ -1,5 +1,11 @@
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    time::Duration,
+};
+
 use actix_web::{
-    App,
+    App, HttpServer,
     http::{Method, StatusCode, header},
     test,
 };
@@ -17,11 +23,40 @@ fn fixture() -> TempDir {
     std::fs::write(root.path().join("about/index.html"), "about").unwrap();
     std::fs::create_dir(root.path().join("assets")).unwrap();
     std::fs::write(root.path().join("assets/app.js"), "console.log('ok')").unwrap();
+    std::fs::write(root.path().join("encoded name.txt"), "encoded").unwrap();
     std::fs::write(root.path().join(".site-meta"), "hidden").unwrap();
     std::fs::create_dir(root.path().join("private")).unwrap();
     std::fs::write(root.path().join("private/secret.txt"), "secret").unwrap();
     std::fs::create_dir(root.path().join("empty")).unwrap();
     root
+}
+
+async fn transport_request(address: SocketAddr, method: &str, path: &str) -> Vec<u8> {
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+
+    actix_web::rt::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        response
+    })
+    .await
+    .unwrap()
+}
+
+fn split_transport_response(response: &[u8]) -> (&str, &[u8]) {
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let headers = std::str::from_utf8(&response[..separator]).unwrap();
+    (headers, &response[separator + 4..])
 }
 
 #[actix_web::test]
@@ -89,6 +124,23 @@ async fn serves_hidden_files() {
 }
 
 #[actix_web::test]
+async fn serves_valid_percent_encoded_filenames() {
+    let root = fixture();
+    let app = test::init_service(App::new().service(static_files(root.path().into(), false))).await;
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/encoded%20name.txt")
+            .to_request(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(test::read_body(response).await, "encoded");
+}
+
+#[actix_web::test]
 async fn does_not_list_directories_without_indexes() {
     let root = fixture();
     let app = test::init_service(App::new().service(static_files(root.path().into(), false))).await;
@@ -119,11 +171,46 @@ async fn head_requests_receive_the_file_response_headers() {
 }
 
 #[actix_web::test]
+async fn head_responses_have_empty_bodies_on_the_http_transport() {
+    let root = fixture();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_root = root.path().to_path_buf();
+    let server =
+        HttpServer::new(move || App::new().service(static_files(server_root.clone(), false)))
+            .listen(listener)
+            .unwrap()
+            .run();
+    let handle = server.handle();
+    let task = actix_web::rt::spawn(server);
+
+    let response = transport_request(address, "HEAD", "/assets/app.js").await;
+
+    handle.stop(true).await;
+    task.await.unwrap().unwrap();
+
+    let (headers, body) = split_transport_response(&response);
+    assert!(headers.starts_with("HTTP/1.1 200"));
+    assert!(body.is_empty());
+}
+
+#[actix_web::test]
 async fn rejects_non_get_and_head_methods() {
     let root = fixture();
     let app = test::init_service(App::new().service(static_files(root.path().into(), false))).await;
 
     let response = test::call_service(&app, test::TestRequest::post().uri("/").to_request()).await;
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[actix_web::test]
+async fn rejects_non_get_and_head_methods_before_path_validation() {
+    let root = fixture();
+    let app = test::init_service(App::new().service(static_files(root.path().into(), false))).await;
+
+    let response =
+        test::call_service(&app, test::TestRequest::post().uri("/%00").to_request()).await;
 
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
@@ -214,6 +301,74 @@ async fn traversal_requests_never_serve_files_or_the_spa_document() {
         "/%2E%2E/private/secret.txt",
         "/%2e%2e%2fprivate/secret.txt",
         "/%00",
+    ] {
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert!(test::read_body(response).await.is_empty(), "{uri}");
+    }
+}
+
+#[actix_web::test]
+async fn decoded_dot_segments_return_empty_not_found_responses() {
+    let root = fixture();
+    let app = test::init_service(App::new().service(static_files(root.path().into(), true))).await;
+
+    for uri in ["/.", "/%2e", "/./..."] {
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert!(test::read_body(response).await.is_empty(), "{uri}");
+    }
+}
+
+#[actix_web::test]
+async fn server_remains_responsive_after_dot_segment_requests() {
+    let root = fixture();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_root = root.path().to_path_buf();
+    let server =
+        HttpServer::new(move || App::new().service(static_files(server_root.clone(), true)))
+            .listen(listener)
+            .unwrap()
+            .run();
+    let handle = server.handle();
+    let task = actix_web::rt::spawn(server);
+
+    for path in ["/.", "/%2e", "/./..."] {
+        let response = transport_request(address, "GET", path).await;
+        let (headers, body) = split_transport_response(&response);
+        assert!(headers.starts_with("HTTP/1.1 404"), "{path}: {headers}");
+        assert!(body.is_empty(), "{path}");
+    }
+
+    let response = transport_request(address, "GET", "/").await;
+
+    handle.stop(true).await;
+    task.await.unwrap().unwrap();
+
+    let (headers, body) = split_transport_response(&response);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert_eq!(body, b"root");
+}
+
+#[actix_web::test]
+async fn actix_invalid_paths_return_empty_not_found_responses() {
+    let root = fixture();
+    let app = test::init_service(App::new().service(static_files(root.path().into(), true))).await;
+
+    for uri in [
+        "/assets%2Fapp.js",
+        "/malformed%2",
+        "/malformed%GG",
+        "/%FF",
+        "/%2Areserved",
+        "/reserved%3A",
+        "/reserved%3C",
+        "/reserved%3E",
     ] {
         let response =
             test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;

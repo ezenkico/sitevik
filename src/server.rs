@@ -4,12 +4,14 @@ use actix_files::{Files, NamedFile, PathBufWrap};
 use actix_web::{
     HttpResponse,
     dev::{ServiceRequest, ServiceResponse, fn_service},
+    http::Method,
 };
 
 pub fn static_files(root: PathBuf, spa: bool) -> Files {
     Files::new("/", root.clone())
         .guard(actix_web::guard::fn_guard(|context| {
-            safe_request_path(context.head().uri.path())
+            !matches!(context.head().method, Method::GET | Method::HEAD)
+                || safe_request_path(context.head().uri.path())
         }))
         .index_file("index.html")
         .use_hidden_files()
@@ -112,7 +114,11 @@ fn safe_request_path(path: &str) -> bool {
         return false;
     };
 
-    !decoded.contains('\0') && decoded.split('/').all(|segment| segment != "..")
+    !decoded.contains('\0')
+        && decoded
+            .split('/')
+            .all(|segment| segment != "." && segment != "..")
+        && PathBufWrap::parse_path(path, true).is_ok()
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
