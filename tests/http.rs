@@ -23,6 +23,27 @@ fn fixture() -> TempDir {
     root
 }
 
+fn release_profile_table(manifest: &str) -> Option<&str> {
+    let mut offset = 0;
+    let mut table_start = None;
+
+    for line in manifest.split_inclusive('\n') {
+        let trimmed = line.trim();
+
+        if let Some(start) = table_start {
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                return Some(&manifest[start..offset]);
+            }
+        } else if trimmed == "[profile.release]" {
+            table_start = Some(offset + line.len());
+        }
+
+        offset += line.len();
+    }
+
+    table_start.map(|start| &manifest[start..])
+}
+
 #[actix_web::test]
 async fn serves_root_index() {
     let root = fixture();
@@ -253,6 +274,8 @@ async fn release_profile_contains_required_optimizations() {
     let manifest =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
 
+    let release_profile = release_profile_table(&manifest).unwrap();
+
     for setting in [
         "opt-level = 3",
         "lto = \"fat\"",
@@ -260,6 +283,22 @@ async fn release_profile_contains_required_optimizations() {
         "strip = true",
         "panic = \"abort\"",
     ] {
-        assert!(manifest.contains(setting), "missing {setting}");
+        assert!(
+            release_profile.lines().any(|line| line.trim() == setting),
+            "missing {setting}"
+        );
     }
+}
+
+#[actix_web::test]
+async fn release_profile_table_excludes_other_tables() {
+    let manifest = r#"
+[profile.release]
+opt-level = 3
+
+[profile.dev]
+lto = "fat"
+"#;
+
+    assert_eq!(release_profile_table(manifest), Some("opt-level = 3\n\n"));
 }
