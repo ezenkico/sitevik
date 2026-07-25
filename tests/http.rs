@@ -6,6 +6,9 @@ use actix_web::{
 use sitevik::static_files;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 fn fixture() -> TempDir {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("index.html"), "root").unwrap();
@@ -216,5 +219,47 @@ async fn traversal_requests_never_serve_files_or_the_spa_document() {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
         assert!(test::read_body(response).await.is_empty(), "{uri}");
+    }
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn filesystem_failure_returns_internal_server_error() {
+    let root = fixture();
+    let unreadable = root.path().join("unreadable.txt");
+    std::fs::write(&unreadable, "unreadable").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    if std::fs::File::open(&unreadable).is_ok() {
+        // Privileged test processes can bypass file permissions.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+
+    let app = test::init_service(App::new().service(static_files(root.path().into(), false))).await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/unreadable.txt").to_request(),
+    )
+    .await;
+
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[actix_web::test]
+async fn release_profile_contains_required_optimizations() {
+    let manifest =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+
+    for setting in [
+        "opt-level = 3",
+        "lto = \"fat\"",
+        "codegen-units = 1",
+        "strip = true",
+        "panic = \"abort\"",
+    ] {
+        assert!(manifest.contains(setting), "missing {setting}");
     }
 }
